@@ -1,0 +1,9 @@
+gradio 
+langchain_community
+langchain_huggingface
+langchain
+sentence-transformers
+faiss-cpu 
+groq 
+PyPDF2
+tqdm
