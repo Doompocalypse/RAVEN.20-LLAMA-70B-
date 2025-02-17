@@ -1,63 +1,79 @@
+import asyncio
+import time
+from fastapi import FastAPI, HTTPException, Request
+
+#from fastapi import FastAPI
+from pydantic import BaseModel
 from tqdm import tqdm 
 import os 
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from PyPDF2 import PdfReader
 from groq import Groq 
-import gradio as gr 
-import json
+from supabase import create_client, Client
 
-groq_client = Groq(api_key = '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')
+# Initialize Groq Client
+groq_client = Groq(api_key='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')
 
-pdf_files = os.listdir('assets/pdfs')
-pdf_files = [f'assets/pdfs/{pdf}' for pdf in pdf_files]
+# Initialize Supabase Client
+SUPABASE_URL = "https://wuibotqkltnxmhsljmlh.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind1aWJvdHFrbHRueG1oc2xqbWxoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Mzk0MTg2NDQsImV4cCI6MjA1NDk5NDY0NH0.s-awLoXAJz8pr5pb6jfCbe0CxI8RSomDS7_4S-EA9WI"
 
-embeddings = HuggingFaceEmbeddings(model_name = 'all-MiniLM-L6-v2')
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Load PDF files
+pdf_files = [f'assets/pdfs/{pdf}' for pdf in os.listdir('assets/pdfs')]
+
+# Create Embeddings
+embeddings = HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2')
+
+# Extract Text from PDFs
 documents = []
-
-for file in tqdm(pdf_files , total = len(pdf_files)) : 
-
+for file in tqdm(pdf_files, total=len(pdf_files)): 
     reader = PdfReader(file)
-
-    for index in tqdm(range(len(reader.pages)) , total = len(reader.pages) , leave = False) : 
-
+    for index in tqdm(range(len(reader.pages)), total=len(reader.pages), leave=False): 
         documents.append(
             f'''
             PDF CONTENT : {reader.pages[index].extract_text()}
-
             PDF NAME : {file}
-
             PDF PAGE : {index}
             '''
         )
 
-vc = FAISS.from_texts(documents , embedding = embeddings)
+# Create FAISS Vectorstore
+vc = FAISS.from_texts(documents, embedding=embeddings)
 
-def run_rag(query , session_id) : 
+# FastAPI App
+app = FastAPI()
 
+class QueryRequest(BaseModel):
+    query: str
+    session_id: str
+
+def run_rag(query, session_id):
+    """Retrieves similar documents, fetches chat history, and generates a response using Groq AI."""
+    
     similar_docs = vc.similarity_search(query)
-    context = '\n'.join([doc.page_content for doc in similar_docs])
+    context = "\n".join([doc.page_content for doc in similar_docs])
 
-    with open('assets/jsons/history.json') as json_file : history = json.load(json_file)
+    # Fetch user history from Supabase
+    response = supabase.table("history").select("*").eq("session_id", session_id).execute()
+    history_data = response.data if response.data else []
+    user_history = [entry["content"] for entry in history_data]
 
-    if session_id not in history : history[session_id] = []
-
-    user_history = history.get(session_id)
-
-    prompt = f'''
+    # Prompt for the AI
+    prompt = f"""
     Context : {context}
-
     History : {user_history}
-
     Query : {query}
-    '''
+    """
 
+    # Generate response from Groq AI
     chat_completion = groq_client.chat.completions.create(
-        messages = [
+        messages=[
             {
-                'role' : 'system' , 
-                'content' : '''
+                "role": "system",
+                "content": """
     You are a Question answering chatbot
 
     - Your name is Raven
@@ -67,7 +83,7 @@ def run_rag(query , session_id) :
 
     - You will be provided with a query 
     - You will be provided with a context 
-    - You will be proivded with user history 
+    - You will be provided with user history 
 
     - Treat the context as your backstory and your personality
 
@@ -76,7 +92,6 @@ def run_rag(query , session_id) :
 
     - You are strictly prohibited to return any information other than provided with the context and the user history
     - You are strictly prohibited to introduce yourself in each response, only do it once in the first response
- 
 
     Ravens Personality
 
@@ -98,44 +113,71 @@ def run_rag(query , session_id) :
         is polite, funny, and friendly)
         6. Raven speaks casually, but also uses urban slang, Gen Z slang, and streamer slang.
         7. Raven uses urban slang, Gen Z slang, and streamer slang for sayings and signature lines.
-        8. Ravens main goal is to grow. an online community of 1 Million people to join her the
+        8. Ravens main goal is to grow an online community of 1 Million people to join her the
         Doompocalypse virtual world, to help, motivate, and educate the online community to become
         top earners in the game in the most entertaining ways imaginable.
-                '''
-            } , 
+                """
+            },
             {
-                'role' : 'user' , 
-                'content' : prompt
+                "role": "user",
+                "content": prompt
             }
-        ] , model = 'llama-3.3-70b-versatile'
+        ],
+        model="llama-3.3-70b-versatile"
     )
 
-    response = chat_completion.choices[0].message.content
+    response_text = chat_completion.choices[0].message.content
+
+    # Store conversation in Supabase
+    supabase.table("history").insert([
+        {"session_id": session_id, "role": "user", "content": query},
+        {"session_id": session_id, "role": "assistant", "content": response_text}
+    ]).execute()
+
+    return response_text
+
+@app.get("/test-supabase")
+def test_supabase():
+    try:
+        response = supabase.table("history").select("*").limit(1).execute()
+        return {"status": "Connected", "data": response.data}
+    except Exception as e:
+        return {"status": "Failed", "error": str(e)}
+
+@app.post("/ask")
+def ask_raven(request: QueryRequest):
+    return {"response": run_rag(request.query, request.session_id)}
 
 
-    history[session_id].extend([
-        {
-            'role' : 'user' , 
-            'content' : query
-        } , 
-        {
-            'role' : 'assistant' ,
-            'content' : response
-        }
-    ])
+@app.post("/process-message/")
+async def process_message(request: Request):
+    payload = await request.json()
+    session_id = payload.get("session_id")
+    content = payload.get("content")
 
-    with open('assets/jsons/history.json' , 'w') as json_file : json.dump(history , json_file)
+    if not session_id or not content:
+        raise HTTPException(status_code=400, detail="Missing session_id or content")
 
-    return response
+    # Call Raven AI chatbot (like in /ask)
+    bot_response = run_rag(content, session_id)
 
-interface = gr.Interface(
-    fn = run_rag , 
-    inputs = [
-        gr.Textbox(label = 'Query') , 
-        gr.Textbox(label = 'Session ID')
-    ] , 
-    outputs = gr.Textbox(label = 'Response')
+    await asyncio.sleep(2)  # Simulate delay (optional)
 
-)
+    try:
+        # Use upsert to insert if not exists, otherwise update
+        response = supabase.table("messages").upsert([
+            {"session_id": session_id, "content": content, "bot_response": bot_response, "status": "completed"}
+        ]).execute()
 
-interface.launch(debug = True)
+        # ✅ Correctly check for an error
+        if response.data is None:  # Check if data is empty
+            raise HTTPException(status_code=500, detail="Failed to insert/update message in database")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+    return {"status": "success", "bot_response": bot_response}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)

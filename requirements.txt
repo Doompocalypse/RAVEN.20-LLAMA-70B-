@@ -7,3 +7,7 @@ faiss-cpu
 groq 
 PyPDF2
 tqdm
+fastapi
+uvicorn
+supabase
+os
